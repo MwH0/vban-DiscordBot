@@ -1,272 +1,117 @@
-from scr.pyVBAN import *
-import pyaudio
-import socket
 import discord
-import threading
+from discord import ui
 from discord.ext import commands
+from scr.pyVBAN import *
 
 help_command = commands.DefaultHelpCommand(no_category="Commands")
 intents = discord.Intents.default()
 intents.voice_states = True
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=help_command)
 streams = []
-
-
-def run(index):
-    while streams[index].running:
-        streams[index].runonce()
-    streams[index].quit()
-
+port = 6980
 
 @bot.event
 async def on_ready():
     print("Logged in as {0.user}".format(bot))
 
+class Select(ui.Select):
+    def __init__(self, devices):
+        self.devices = devices
+        options = [
+            discord.SelectOption(label=device['name'], emoji=f"{i}\uFE0F\u20E3") 
+            for i, device in enumerate(devices)  # Limit to the first 10 devices for emoji response
+        ]
+        super().__init__(placeholder="Select a device", max_values=1, min_values=1, options=options)
 
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
+    async def callback(self, interaction: discord.Interaction):
+        selected_label = self.values[0]
+        device_index = next(i for i, device in enumerate(self.devices) if device['name'] == selected_label)
+        await interaction.response.send_message(f"Selected device: {selected_label} ", ephemeral=True)
+        self.view.device_index = device_index
+        self.view.stop()
+
+class SelectView(ui.View):
+    def __init__(self, devices, *, timeout=180):
+        super().__init__(timeout=timeout)
+        self.device_index = None
+        self.add_item(Select(devices))
+
+@bot.command()
+async def recv(ctx, name, ip):
+    """Creates an audio receiver stream."""
+    devices = list_audio_devices(type="output")
+    view = SelectView(devices)
+    await ctx.send("Select an output device:", view=view)
+    await view.wait()
+    if view.device_index is not None:
+        device = devices[view.device_index]['index']
+        stream = ReceiverStream(ip, name, port, device)
+        stream.start
+        streams.append(stream)
+        await ctx.send(f"VBAN Receiver created with device index {device}.")
     else:
-        await bot.process_commands(message)
+        await ctx.send("No device was selected.")
+
+@bot.command()
+async def emit(ctx, name, ip):
+    """Creates an audio emitter stream."""
+    devices = list_audio_devices(type="input")
+    view = SelectView(devices)
+    await ctx.send("Select an output device:", view=view)
+    await view.wait()  # Wait until the view interaction is finished
+    if view.device_index is not None:
+        device = devices[view.device_index]['index']
+        stream = SenderStream(ip, name, port, device)
+        stream.start
+        streams.append(stream)
+        await ctx.send(f"VBAN Receiver created with device index {device}.")
+    else:
+        await ctx.send("No device was selected.")
 
 
-@bot.command(help="list all streams")
+@bot.command()
 async def list(ctx):
-    for index, stream in enumerate(streams):
-        stream = (
-            "Index:"
-            + str(index)
-            + " Stream: "
-            + stream.streamName
-            + " IP: "
-            + stream.ip
-            + " Port: "
-            + str(stream.port)
-        )
-        if type(stream) == VBAN_Recv:
-            stream += (
-                " DeviceIndex: "
-                + str(stream.deviceIndex)
-                + " Running: "
-                + str(stream.running)
-            )
-        elif type(stream) == VBAN_Emit:
-            stream += (
-                " DeviceIndex: "
-                + str(stream.deviceIndex)
-                + " Sample Rate: "
-                + str(stream.samprate)
-                + " Running: "
-                + str(stream.running)
-            )
-        elif type(stream) == VBAN_Text:
-            stream += " BaudRate: " + str(stream.baudRate)
-        else:
-            await ctx.send("Error: Unknown stream type")
-    if len(streams) == 0:
-        stream = "No streams found. Use !recv or !send to add"
-    await ctx.send(stream)
+    """Lists all active streams."""
+    if not streams:
+        await ctx.send("No active streams.")
+        return
+    message = "Active Streams:\n"
+    for stream in streams:
+        # - Emitter: `Emitter1` (192.168.1.1:8080, running), Emitter2 (192.168.1.2:8081, stopped)
+        message += f"- {'Receiver ' if stream == ReceiverStream else 'Emitter '}: `{stream.name}` ({stream.ip}:{stream.port} {'is running' if stream.running else 'has stopped'})\n"
+    await ctx.send(message)
 
+@bot.command()
+async def txt(ctx, *, message: str):
+    """Sends a text message to a selected stream."""
+    if not streams:
+        await ctx.send("No active streams to send a message to.")
+        return
 
-@bot.command(help="list bot ip address")
-async def netls(ctx):
-    netInfo = socket.gethostbyname_ex(socket.gethostname())
-    netls = str(len(netInfo[2])) + " Network information - " + str(netInfo[0]) + "\n"
-    for ip in netInfo[2]:
-        if ip.split(".")[-1] == "1":
-            netls += "Default Gateway - " + str(ip) + "\n"
-        else:
-            local_ip = str(ip)
-            netls += "Local IP address - " + local_ip + "\n"
-    await ctx.send(netls)
+    message_text = "Select a stream:\n"
+    for i, (name) in enumerate(streams.items()):
+        if i < 10:
+            message_text += f"{i}️⃣ `{name}`\n"
+    msg = await ctx.send(message_text)
+    for i in range(len(streams)):
+        await msg.add_reaction(f"{i}️⃣")
 
+    def check(reaction, user):
+        return user == ctx.author and reaction.message.id == msg.id
 
-@bot.command(
-    help="[*streamName] [*ip] [port] [deviceIndex] [verbose]: create a VBAN receiver"
-)
-async def recv(ctx, streamName, ip, port=6980, deviceIndex=0, verbose=False):
-    receiver = VBAN_Recv(ip, int(port), streamName, deviceIndex, verbose)
-    streams.append(receiver)
-    recvThread = threading.Thread(target=run(len(streams) - 1))
-    recvThread.start()
-    await ctx.send("Added a VBAN receiver to index " + str(len(streams) - 1))
+    reaction, _ = await bot.wait_for("reaction_add", check=check)
+    chosen_index = int(reaction.emoji[0])
+    chosen_stream = list(streams.values())[chosen_index]
 
+    chosen_stream.send(message.encode('utf-8'))
+    await ctx.send(f"Message sent to stream `{list(streams.keys())[chosen_index]}`.")
 
-@bot.command(
-    help="[*streamName] [*ip] [port] [deviceIndex] [verbose]: create a VBAN receiver"
-)
-async def emit(ctx, streamName, ip, port=6980, deviceIndex=0, verbose=False):
-    emitter = VBAN_Emit(ip, port, streamName, sampRate, deviceIndex, verbose)
-    streams.append(emitter)
-    emitThread = threading.Thread(target=run(len(streams) - 1))
-    emitThread.start()
-    await ctx.send("Added a VBAN emitter to index " + str(len(streams) - 1))
-
-
-@bot.command(help="[*streamName] [*ip] [port] [baudRate]: create a VBAN text sender")
-async def text(ctx, streamName, ip, port=6980, baudRate=9600):
-    textSender = VBAN_Text(ip, port, streamName, baudRate)
-    await ctx.send("Added a VBAN textSender to index " + str(len(streams) - 1))
-    VBAN_Text(ip, port, streamName, baudRate)
-
-
-@bot.command(help="[*index] [*text]: sent a text with VBAN text sender")
-async def sent(ctx, index, text):
-    streams[int(index)].send(text)
-    await ctx.send("Sent text to stream " + index)
-
-
-@bot.command(help="[*index] [*streamName] [*ip] [*port] [DeviceIndex]: edit a stream")
-async def edit(ctx, index, streamName, ip, port, DeviceIndex=0):
-    if port == None and int(ip.split(":")[1]) != None:
-        DeviceIndex = port
-        port = int(ip.split(":")[1])
-    elif port == None and int(ip.split(":")[1]) == None:
-        port = streams[int(index)].port
-    streams[int(index)].ip = ip
-    streams[int(index)].port = port
-    streams[int(index)].streamName = streamName
-    if (
-        type(streams[int(index)]) == VBAN_Recv or type(streams[int(index)]) == VBAN_Emit
-    ) and (DeviceIndex != 0 and DeviceIndex != None):
-        streams[int(index)].deviceIndex = DeviceIndex
-    elif (
-        type(streams[int(index)]) == VBAN_Emit
-        and DeviceIndex != 0
-        and DeviceIndex != None
-    ):
-        streams[int(index)].deviceIndex = DeviceIndex
-    elif DeviceIndex != 0 and DeviceIndex != None:
-        await ctx.send("Error: DeviceIndex only works on VBAN_Recv and VBAN_Emit")
-    await ctx.send("Edited stream " + index)
-
-
-@bot.command(help="[*index] [*streamName]: rename a stream")
-async def rename(ctx, index, streamName):
-    streams[int(index)].streamName = streamName
-    await ctx.send("Renamed stream " + index)
-
-
-@bot.command(help="[*index] [*ip] [port]: change the ip of a stream")
-async def reip(ctx, index, ip, port):
-    if port == None and int(ip.split(":")[1]) != None:
-        port = int(ip.split(":")[1])
-    elif port == None and int(ip.split(":")[1]) == None:
-        port = streams[int(index)].port
-    streams[int(index)].port = port
-    streams[int(index)].ip = ip
-    await ctx.send("Changed ip of stream " + index)
-
-
-@bot.command(help="[*index]: toggle a stream")
-async def toggle(ctx, index):
-    if type(streams[int(index)]) == VBAN_Recv or type(streams[int(index)]) == VBAN_Emit:
-        streams[int(index)].running = not streams[int(index)].running
-    elif type(streams[int(index)]) == VBAN_Text:
-        await ctx.send("Error: VBAN_Text does not support toggle")
-    else:
-        await ctx.send("Error: Unknown stream type")
-    await ctx.send("Stopped stream " + index)
-
-
-@bot.command(help="[*index]: delete a stream")
-async def quit(ctx, index):
-    streams[int(index)].quit()
-    streams.pop(int(index))
-    await ctx.send("Deleted stream " + index)
-
-
-@bot.command(help="[*index]: toggle verbose mode")
-async def verbose(ctx, index):
-    if type(streams[int(index)]) == VBAN_Recv or type(streams[int(index)]) == VBAN_Emit:
-        streams[int(index)].verbose = not streams[int(index)].verbose
-    elif type(streams[int(index)]) == VBAN_Text:
-        await ctx.send("Error: VBAN_Text does not support verbose mode")
-    else:
-        await ctx.send("Error: Unknown stream type")
-    await ctx.send("Toggled verbose mode of stream " + index)
-
-
-@bot.command(help="[*index] [*sampleRate]: change the sample rate of a stream")
-async def sampRate(ctx, index, sampleRate):
-    if type(streams[int(index)]) == VBAN_Recv or type(streams[int(index)]) == VBAN_Emit:
-        streams[int(index)].samprate = sampleRate
-    elif type(streams[int(index)]) == VBAN_Text:
-        await ctx.send("Error: VBAN_Text does not support sample rate")
-    else:
-        await ctx.send("Error: Unknown stream type")
-    await ctx.send("Changed sample rate of stream " + index)
-
-
-@bot.command(help="list all output and input devices")
-async def devls(ctx):
-    p = pyaudio.PyAudio()
-    info = p.get_host_api_info_by_index(0)
-    numdevices = info.get("deviceCount")
-    devls = "--- INPUT DEVICES ---\n"
-    for i in range(0, numdevices):
-        if (
-            p.get_device_info_by_host_api_device_index(0, i).get("maxInputChannels")
-        ) > 0:
-            devls += (
-                "Input Device id "
-                + str(i)
-                + " - "
-                + p.get_device_info_by_host_api_device_index(0, i).get("name")
-                + "\n"
-            )
-    devls += "--- OUTPUT DEVICES ---\n"
-    for i in range(0 + numdevices):
-        if (
-            p.get_device_info_by_host_api_device_index(0, i).get("maxOutputChannels")
-        ) > 0:
-            devls += (
-                "Input Device id "
-                + str(i)
-                + " - "
-                + p.get_device_info_by_host_api_device_index(0, i).get("name")
-                + "\n"
-            )
-    await ctx.send(devls)
-
-
-@bot.command(help="[*index] [*DeviceIndex]: change the output device of a stream")
-async def outdev(ctx, index, DeviceIndex):
-    if type(streams[int(index)]) == VBAN_Recv or type(streams[int(index)]) == VBAN_Emit:
-        streams[int(index)].deviceIndex = DeviceIndex
-    elif type(streams[int(index)]) == VBAN_Text:
-        await ctx.send("Error: VBAN_Text does not support output device")
-    else:
-        await ctx.send("Error: Unknown stream type")
-    await ctx.send("Changed output device of stream " + index)
-
-
-@bot.command(help="[*index] [*DeviceIndex]: change the input device of a stream")
-async def indev(ctx, index, DeviceIndex):
-    if type(streams[int(index)]) == VBAN_Recv or type(streams[int(index)]) == VBAN_Emit:
-        streams[int(index)].deviceIndex = DeviceIndex
-    elif type(streams[int(index)]) == VBAN_Text:
-        await ctx.send("Error: VBAN_Text does not support input device")
-    else:
-        await ctx.send("Error: Unknown stream type")
-    await ctx.send("Changed input device of stream " + index)
-
-
-@bot.command(help="[*ip] [port]: ping a stream")
-async def ping(ctx, ip="0.0.0.0", port=6980):
-    if port == None and int(ip.split(":")[1]) != None:
-        port = int(ip.split(":")[1])
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((ip, port))
-        await ctx.send(f"Ping {ip}:{port} successful")
-        # Close the socket
-        s.close()
-    except:
-        await ctx.send(f"Ping {ip}:{port} failed")
-
-
+@bot.command()
+async def sys(ctx):
+    """Shows a panel for system settings."""
+    # This would involve creating a more complex UI or settings dialog.
+    await ctx.send("System settings are not yet implemented.")
+    
 token = open("token.txt", "r").read()
 bot.run(token)
+

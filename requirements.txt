@@ -1,2 +1,3 @@
 pyaudio
 discord
+pyVBAN
